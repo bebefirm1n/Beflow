@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 import json
 import os
+import re
 import asyncio
 import logging
 from dotenv import load_dotenv
@@ -29,8 +30,8 @@ LIEN_INVITATION = (
 # ═══════════════════════════════════════════════════════════
 #  RÉGLAGES
 # ═══════════════════════════════════════════════════════════
-DUREE_CHOIX = 60          # secondes laissées au membre pour choisir un type
-DELAI_NETTOYAGE = 3       # secondes d'attente avant de vérifier si un vocal temp est vide
+DUREE_CHOIX = 60            # secondes laissées au membre pour choisir un type
+DELAI_NETTOYAGE = 3         # secondes d'attente avant de vérifier si un vocal temp est vide
 DELAI_SUPPRESSION_MSG = 20  # secondes avant de supprimer le message une fois le résultat connu
 CONFIG_PATH = "vocaux_config.json"
 
@@ -39,9 +40,12 @@ CONFIG_PATH = "vocaux_config.json"
 #
 #  Structure d'un serveur :
 #  {
-#    "hubs": {"<channel_id>": {"types": ["Duo", "Trio"]}, ...},
-#    "types": {"<nom>": {"limite":..., "modifiable_nom":..., "modifiable_limite":..., "format_nom":...}, ...},
+#    "hubs": {"<channel_id>": {"types": ["Duo", "Trio"], "categorie_cible": "<id>"}, ...},
+#    "types": {"<nom>": {"limite":..., "modifiable_nom":..., "modifiable_limite":...,
+#                        "masque_defaut":..., "format_nom":..., "emoji":...}, ...},
 #    "temp_channels": {"<channel_id>": {"owner_id":..., "type":..., "masque":..., "verrou":...}, ...},
+#    "categories": {"<category_id>": {"roles": ["<role_id>", ...]}, ...},
+#    "banwords": ["mot1", "mot2"],
 #  }
 # ═══════════════════════════════════════════════════════════
 def charger_configuration():
@@ -52,8 +56,12 @@ def charger_configuration():
 
 
 def sauvegarder_configuration():
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    # Écriture atomique : on écrit dans un fichier temporaire puis on remplace,
+    # pour ne jamais corrompre le JSON si le bot plante pendant l'écriture.
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(configuration, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONFIG_PATH)
 
 
 configuration = charger_configuration()
@@ -94,6 +102,52 @@ def config_serveur(guild_id: int) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
+#  UTILITAIRES
+# ═══════════════════════════════════════════════════════════
+RE_EMOJI_CUSTOM = re.compile(r"^<a?:\w{2,32}:\d{17,20}>$")
+
+
+def emoji_valide(v: str) -> bool:
+    """Vrai si v est vide, un emoji personnalisé <:nom:id>, ou un emoji Unicode (non ASCII)."""
+    return not v or bool(RE_EMOJI_CUSTOM.match(v)) or (not v.isascii() and len(v) <= 16)
+
+
+def emoji_type(info: dict) -> str:
+    """Emoji configuré pour un type de vocal, avec repli sur 🔊 si aucun n'est défini
+    (ou s'il est invalide, pour ne jamais casser un menu Discord)."""
+    e = info.get("emoji")
+    return e if e and emoji_valide(e) else "🔊"
+
+
+def copie_overwrites(categorie):
+    """Copie indépendante des overwrites d'une catégorie
+    (sinon on modifierait directement ceux de la catégorie)."""
+    if not categorie:
+        return {}
+    return {
+        cible: discord.PermissionOverwrite.from_pair(*ow.pair())
+        for cible, ow in categorie.overwrites.items()
+    }
+
+
+def valeur_categorie(salon, cible, attr):
+    """Valeur de base héritée de la catégorie du salon (None si aucune)."""
+    if not salon.category:
+        return None
+    return getattr(salon.category.overwrites_for(cible), attr)
+
+
+def hubs_valides(guild: discord.Guild, gconf: dict) -> list:
+    """Liste (id, salon) des hubs dont le salon existe encore."""
+    resultat = []
+    for cid in gconf["hubs"]:
+        salon = guild.get_channel(int(cid))
+        if salon:
+            resultat.append((cid, salon))
+    return resultat
+
+
+# ═══════════════════════════════════════════════════════════
 #  BOT — pas besoin d'intents privilégiés (members/presence)
 # ═══════════════════════════════════════════════════════════
 intents = discord.Intents.default()
@@ -102,23 +156,39 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 arbre = bot.tree
 
+# Menus de choix de type en attente : (guild_id, member_id) -> ChoixTypeView
+choix_en_cours: dict[tuple[int, int], "ChoixTypeView"] = {}
+
+
+async def setup_hook():
+    # Vue persistante : nécessaire pour que les boutons du panneau vocal
+    # continuent de fonctionner après un redémarrage du bot.
+    # setup_hook n'est appelé qu'une seule fois (contrairement à on_ready).
+    bot.add_view(PanelVocalView())
+    await arbre.sync()
+
+
+bot.setup_hook = setup_hook
+
 
 @bot.event
 async def on_ready():
-    # Vue persistante : nécessaire pour que les boutons du panneau vocal
-    # continuent de fonctionner après un redémarrage du bot
-    bot.add_view(PanelVocalView())
+    # on_ready peut se déclencher plusieurs fois (reconnexions) : on n'initialise qu'une fois
+    if getattr(bot, "_init_ok", False):
+        return
+    bot._init_ok = True
 
     # Nettoyage au démarrage : hubs/vocaux supprimés pendant que le bot était offline
     for gid, gconf in list(configuration.items()):
         guild = bot.get_guild(int(gid))
         if not guild:
             continue
+        gconf = config_serveur(int(gid))
         gconf["hubs"] = {
-            cid: info for cid, info in gconf.get("hubs", {}).items() if guild.get_channel(int(cid))
+            cid: info for cid, info in gconf["hubs"].items() if guild.get_channel(int(cid))
         }
         gconf["categories"] = {
-            cid: info for cid, info in gconf.get("categories", {}).items() if guild.get_channel(int(cid))
+            cid: info for cid, info in gconf["categories"].items() if guild.get_channel(int(cid))
         }
         for cid in list(gconf["temp_channels"].keys()):
             salon = guild.get_channel(int(cid))
@@ -131,30 +201,35 @@ async def on_ready():
                         pass
     sauvegarder_configuration()
 
-    await arbre.sync()
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="Nadouja & Mitteg & Not Feller")
     )
     print(f"[✓] {bot.user} connecté — Slash commands synchronisées.")
 
 
+@bot.event
+async def on_guild_channel_delete(channel):
+    """Nettoie la config quand un salon / une catégorie est supprimé(e) à la main."""
+    gconf = config_serveur(channel.guild.id)
+    cid = str(channel.id)
+    modifie = False
+    for section in ("hubs", "temp_channels", "categories"):
+        if gconf[section].pop(cid, None) is not None:
+            modifie = True
+    if modifie:
+        sauvegarder_configuration()
+
+
 # ═══════════════════════════════════════════════════════════
 #  MENU DE CHOIX DU TYPE DE VOCAL (affiché dans le chat vocal)
 # ═══════════════════════════════════════════════════════════
-def emoji_type(info: dict) -> str:
-    """Emoji configuré pour un type de vocal, avec repli sur 🔊 si aucun n'est défini.
-    Accepte un emoji Unicode classique ou un emoji personnalisé du serveur (collé tel
-    quel depuis le clavier à emojis de Discord dans le champ du formulaire)."""
-    return info.get("emoji") or "🔊"
-
-
 class ChoixTypeSelect(discord.ui.Select):
     def __init__(self, membre: discord.Member, types_disponibles: dict):
         self.membre = membre
         options = [
             discord.SelectOption(
                 label=nom,
-                description=f"Limite : {info['limite']} membre(s)" if info["limite"] else "Limite : illimitée",
+                description=f"Limite : {info.get('limite')} membre(s)" if info.get("limite") else "Limite : illimitée",
                 emoji=emoji_type(info),
             )
             for nom, info in list(types_disponibles.items())[:25]
@@ -172,20 +247,24 @@ class ChoixTypeSelect(discord.ui.Select):
                 "❌ Ce choix ne t'est pas destiné.", ephemeral=True
             )
             return
-        await creer_vocal_temporaire(interaction, self.membre, self.values[0])
+        choix_en_cours.pop((self.membre.guild.id, self.membre.id), None)
         self.view.stop()
+        await creer_vocal_temporaire(interaction, self.membre, self.values[0])
 
 
 class ChoixTypeView(discord.ui.View):
-    def __init__(self, membre: discord.Member, types_disponibles: dict):
+    def __init__(self, membre: discord.Member, types_disponibles: dict, hub_id: int):
         super().__init__(timeout=DUREE_CHOIX)
         self.membre = membre
+        self.hub_id = hub_id
         self.message: discord.Message | None = None
         self.add_item(ChoixTypeSelect(membre, types_disponibles))
 
     async def on_timeout(self):
-        # Le membre n'a pas répondu à temps → on le déconnecte du vocal
-        if self.membre.voice is not None:
+        choix_en_cours.pop((self.membre.guild.id, self.membre.id), None)
+        voice = self.membre.voice
+        # On ne déconnecte que si le membre est TOUJOURS dans le hub
+        if voice and voice.channel and voice.channel.id == self.hub_id:
             try:
                 await self.membre.move_to(None)
             except discord.HTTPException:
@@ -226,21 +305,33 @@ class RenommerVocalModal(discord.ui.Modal, title="Renommer le vocal"):
         self.guild_id = guild_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Le renommage est limité par Discord (2 / 10 min) et peut être lent → defer
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         salon = interaction.guild.get_channel(self.channel_id)
         if not salon:
-            await interaction.response.send_message("❌ Salon introuvable.", ephemeral=True)
+            await interaction.followup.send("❌ Salon introuvable.", ephemeral=True)
+            return
+
+        nom = self.nouveau_nom.value.strip()[:100]
+        if not nom:
+            await interaction.followup.send("❌ Le nom ne peut pas être vide.", ephemeral=True)
             return
 
         gconf = config_serveur(self.guild_id)
-        nom_lower = self.nouveau_nom.value.lower()
+        nom_lower = nom.lower()
         if any(mot in nom_lower for mot in gconf.get("banwords", []) if mot):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Ce nom contient un mot interdit. Choisis un autre nom.", ephemeral=True
             )
             return
 
-        await salon.edit(name=self.nouveau_nom.value[:100])
-        await interaction.response.send_message(f"✅ Vocal renommé en **{self.nouveau_nom.value}**.", ephemeral=True)
+        try:
+            await salon.edit(name=nom)
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Impossible de renommer le vocal pour le moment.", ephemeral=True)
+            return
+        await interaction.followup.send(f"✅ Vocal renommé en **{nom}**.", ephemeral=True)
 
 
 class LimiteVocalModal(discord.ui.Modal, title="Changer la limite"):
@@ -260,8 +351,13 @@ class LimiteVocalModal(discord.ui.Modal, title="Changer la limite"):
         if not salon:
             await interaction.response.send_message("❌ Salon introuvable.", ephemeral=True)
             return
-        await salon.edit(user_limit=valeur)
-        await interaction.response.send_message(
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await salon.edit(user_limit=valeur)
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Impossible de modifier la limite.", ephemeral=True)
+            return
+        await interaction.followup.send(
             f"✅ Limite mise à jour : **{valeur if valeur else 'illimitée'}**.", ephemeral=True
         )
 
@@ -281,12 +377,11 @@ def embed_panel_vocal(type_nom: str, masque: bool, verrou: bool, emoji: str = "�
     return embed
 
 
-
 class PanelVocalView(discord.ui.View):
     """Vue du panneau affiché dans chaque vocal temporaire.
 
     Les custom_id sont fixes pour rester utilisables après un redémarrage du bot
-    (une instance par défaut est enregistrée comme vue persistante dans on_ready).
+    (une instance par défaut est enregistrée comme vue persistante dans setup_hook).
     À chaque envoi ou édition réelle, on reconstruit une instance avec l'état
     courant (masque/verrou) pour que les libellés des boutons restent corrects.
     """
@@ -331,137 +426,171 @@ class PanelVocalView(discord.ui.View):
         gconf = config_serveur(interaction.guild_id)
         return gconf, gconf["temp_channels"].get(str(interaction.channel_id))
 
-    async def bouton_renommer(self, interaction: discord.Interaction):
+    async def _verifier(self, interaction: discord.Interaction, permission: str | None = None):
+        """Vérifie que le salon est temporaire, que l'utilisateur en est le créateur et,
+        si demandé, que le type autorise l'action. Retourne (gconf, info) ou None
+        (après avoir répondu à l'utilisateur)."""
         gconf, info = self._info(interaction)
         if not info:
             await interaction.response.send_message("❌ Ce salon n'est plus un vocal temporaire.", ephemeral=True)
-            return
+            return None
         if info["owner_id"] != interaction.user.id:
             await interaction.response.send_message("❌ Seul le créateur du vocal peut le modifier.", ephemeral=True)
-            return
-        type_info = gconf["types"].get(info["type"])
-        if not type_info or not type_info.get("modifiable_nom"):
-            await interaction.response.send_message("❌ Le nom de ce vocal ne peut pas être modifié.", ephemeral=True)
+            return None
+        if permission:
+            type_info = gconf["types"].get(info["type"])
+            if not type_info or not type_info.get(permission):
+                texte = (
+                    "❌ Le nom de ce vocal ne peut pas être modifié."
+                    if permission == "modifiable_nom"
+                    else "❌ La limite de ce vocal ne peut pas être modifiée."
+                )
+                await interaction.response.send_message(texte, ephemeral=True)
+                return None
+        return gconf, info
+
+    async def bouton_renommer(self, interaction: discord.Interaction):
+        if not await self._verifier(interaction, "modifiable_nom"):
             return
         await interaction.response.send_modal(RenommerVocalModal(interaction.channel_id, interaction.guild_id))
 
     async def bouton_limite(self, interaction: discord.Interaction):
-        gconf, info = self._info(interaction)
-        if not info:
-            await interaction.response.send_message("❌ Ce salon n'est plus un vocal temporaire.", ephemeral=True)
-            return
-        if info["owner_id"] != interaction.user.id:
-            await interaction.response.send_message("❌ Seul le créateur du vocal peut le modifier.", ephemeral=True)
-            return
-        type_info = gconf["types"].get(info["type"])
-        if not type_info or not type_info.get("modifiable_limite"):
-            await interaction.response.send_message("❌ La limite de ce vocal ne peut pas être modifiée.", ephemeral=True)
+        if not await self._verifier(interaction, "modifiable_limite"):
             return
         await interaction.response.send_modal(LimiteVocalModal(interaction.channel_id))
 
     async def bouton_masquer(self, interaction: discord.Interaction):
-        gconf, info = self._info(interaction)
-        if not info:
-            await interaction.response.send_message("❌ Ce salon n'est plus un vocal temporaire.", ephemeral=True)
+        verif = await self._verifier(interaction)
+        if not verif:
             return
-        if info["owner_id"] != interaction.user.id:
-            await interaction.response.send_message("❌ Seul le créateur du vocal peut le modifier.", ephemeral=True)
-            return
+        gconf, info = verif
 
+        await interaction.response.defer()
         salon = interaction.channel
+        everyone = interaction.guild.default_role
         nouvel_etat = not info.get("masque", False)
-        overwrite = salon.overwrites_for(interaction.guild.default_role)
-        overwrite.view_channel = False if nouvel_etat else None
+        overwrite = salon.overwrites_for(everyone)
+        # En « affichant », on revient à la valeur héritée de la catégorie (et non None),
+        # pour ne pas effacer une restriction de rôle de la catégorie.
+        overwrite.view_channel = False if nouvel_etat else valeur_categorie(salon, everyone, "view_channel")
         try:
-            await salon.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            await salon.set_permissions(everyone, overwrite=overwrite)
         except discord.HTTPException:
-            await interaction.response.send_message("❌ Impossible de modifier les permissions du salon.", ephemeral=True)
+            await interaction.followup.send("❌ Impossible de modifier les permissions du salon.", ephemeral=True)
             return
 
         info["masque"] = nouvel_etat
         sauvegarder_configuration()
 
-        nouvelle_vue = PanelVocalView(masque=nouvel_etat, verrou=info.get("verrou", False))
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=embed_panel_vocal(
                 info["type"], nouvel_etat, info.get("verrou", False),
                 emoji=emoji_type(gconf["types"].get(info["type"], {})),
             ),
-            view=nouvelle_vue,
+            view=PanelVocalView(masque=nouvel_etat, verrou=info.get("verrou", False)),
         )
 
     async def bouton_verrou(self, interaction: discord.Interaction):
-        gconf, info = self._info(interaction)
-        if not info:
-            await interaction.response.send_message("❌ Ce salon n'est plus un vocal temporaire.", ephemeral=True)
+        verif = await self._verifier(interaction)
+        if not verif:
             return
-        if info["owner_id"] != interaction.user.id:
-            await interaction.response.send_message("❌ Seul le créateur du vocal peut le modifier.", ephemeral=True)
-            return
+        gconf, info = verif
 
+        await interaction.response.defer()
         salon = interaction.channel
+        everyone = interaction.guild.default_role
         nouvel_etat = not info.get("verrou", False)
-        overwrite = salon.overwrites_for(interaction.guild.default_role)
-        overwrite.connect = False if nouvel_etat else None
+        overwrite = salon.overwrites_for(everyone)
+        overwrite.connect = False if nouvel_etat else valeur_categorie(salon, everyone, "connect")
         try:
-            await salon.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            await salon.set_permissions(everyone, overwrite=overwrite)
         except discord.HTTPException:
-            await interaction.response.send_message("❌ Impossible de modifier les permissions du salon.", ephemeral=True)
+            await interaction.followup.send("❌ Impossible de modifier les permissions du salon.", ephemeral=True)
             return
 
         info["verrou"] = nouvel_etat
         sauvegarder_configuration()
 
-        nouvelle_vue = PanelVocalView(masque=info.get("masque", False), verrou=nouvel_etat)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=embed_panel_vocal(
                 info["type"], info.get("masque", False), nouvel_etat,
                 emoji=emoji_type(gconf["types"].get(info["type"], {})),
             ),
-            view=nouvelle_vue,
+            view=PanelVocalView(masque=info.get("masque", False), verrou=nouvel_etat),
         )
 
 
 async def creer_vocal_temporaire(interaction: discord.Interaction, membre: discord.Member, nom_type: str):
+    await interaction.response.defer()  # évite l'expiration des 3 s
+    msg = await interaction.original_response()
+
     gconf = config_serveur(membre.guild.id)
     type_info = gconf["types"].get(nom_type)
-    if not type_info:
-        await interaction.response.send_message("❌ Ce type de vocal n'existe plus.", ephemeral=True)
-        return
-
     hub = interaction.channel
-    nom_salon = type_info["format_nom"].format(pseudo=membre.display_name, type=nom_type)[:100]
+
+    async def echec(texte: str):
+        embed = discord.Embed(description=texte, color=0xFF4444)
+        try:
+            await interaction.edit_original_response(content=None, embed=embed, view=None)
+            asyncio.create_task(supprimer_message_plus_tard(msg))
+        except discord.HTTPException:
+            pass
+
+    if not type_info:
+        return await echec("❌ Ce type de vocal n'existe plus.")
+    # Le membre a pu quitter le hub entre-temps → sinon on créerait un salon orphelin jamais supprimé
+    if not membre.voice or not membre.voice.channel or membre.voice.channel.id != hub.id:
+        return await echec("❌ Tu as quitté le hub, demande annulée.")
+
+    try:
+        nom_salon = type_info.get("format_nom", "🔊 {type} de {pseudo}").format(
+            pseudo=membre.display_name, type=nom_type
+        )
+    except (KeyError, IndexError, ValueError):  # ex. format personnalisé contenant {truc}
+        nom_salon = f"🔊 {nom_type} de {membre.display_name}"
+    nom_salon = nom_salon[:100]
 
     # Catégorie cible : celle configurée pour le hub si elle existe encore, sinon la catégorie du hub
     hub_info = gconf["hubs"].get(str(hub.id), {})
     categorie_cible = None
-    categorie_cible_id = hub_info.get("categorie_cible")
-    if categorie_cible_id:
-        categorie_cible = membre.guild.get_channel(int(categorie_cible_id))
+    if hub_info.get("categorie_cible"):
+        categorie_cible = membre.guild.get_channel(int(hub_info["categorie_cible"]))
     if not isinstance(categorie_cible, discord.CategoryChannel):
         categorie_cible = hub.category
 
     masque_initial = type_info.get("masque_defaut", False)
 
     # Le vocal créé reprend les restrictions de rôle éventuelles de sa catégorie cible
-    overwrites = dict(categorie_cible.overwrites) if categorie_cible else {}
+    overwrites = copie_overwrites(categorie_cible)
     if masque_initial:
-        overwrite_everyone = overwrites.get(membre.guild.default_role, discord.PermissionOverwrite())
-        overwrite_everyone.view_channel = False
-        overwrites[membre.guild.default_role] = overwrite_everyone
+        ow = overwrites.get(membre.guild.default_role, discord.PermissionOverwrite())
+        ow.view_channel = False
+        overwrites[membre.guild.default_role] = ow
+    # Le créateur garde toujours l'accès (posé directement à la création : un appel API en moins)
+    ow_membre = overwrites.get(membre, discord.PermissionOverwrite())
+    ow_membre.view_channel = True
+    ow_membre.connect = True
+    overwrites[membre] = ow_membre
 
-    nouveau_salon = await membre.guild.create_voice_channel(
-        name=nom_salon,
-        category=categorie_cible,
-        user_limit=type_info["limite"],
-        overwrites=overwrites,
-    )
-
-    # Le créateur garde toujours accès à son vocal, même s'il le masque ou le verrouille ensuite
     try:
-        await nouveau_salon.set_permissions(membre, view_channel=True, connect=True)
+        nouveau_salon = await membre.guild.create_voice_channel(
+            name=nom_salon,
+            category=categorie_cible,
+            user_limit=type_info.get("limite", 0),
+            overwrites=overwrites,
+        )
     except discord.HTTPException:
-        pass
+        return await echec("❌ Impossible de créer le vocal (permissions ou limite de salons atteinte ?).")
+
+    try:
+        await membre.move_to(nouveau_salon)
+    except discord.HTTPException:
+        # Impossible de le déplacer : on supprime le salon, sinon il resterait vide pour toujours
+        try:
+            await nouveau_salon.delete(reason="Déplacement impossible")
+        except discord.HTTPException:
+            pass
+        return await echec("❌ Impossible de te déplacer dans le nouveau vocal.")
 
     gconf["temp_channels"][str(nouveau_salon.id)] = {
         "owner_id": membre.id,
@@ -471,19 +600,16 @@ async def creer_vocal_temporaire(interaction: discord.Interaction, membre: disco
     }
     sauvegarder_configuration()
 
-    try:
-        await membre.move_to(nouveau_salon)
-    except discord.HTTPException:
-        pass
-
     embed = discord.Embed(
         title="✅ Vocal créé !",
         description=f"{membre.mention}, ton vocal **{nom_salon}** a été créé et tu y as été déplacé.",
         color=0x00FF88,
     )
-    await interaction.response.edit_message(content=None, embed=embed, view=None)
-    msg = await interaction.original_response()
-    asyncio.create_task(supprimer_message_plus_tard(msg))
+    try:
+        await interaction.edit_original_response(content=None, embed=embed, view=None)
+        asyncio.create_task(supprimer_message_plus_tard(msg))
+    except discord.HTTPException:
+        pass
 
     try:
         await nouveau_salon.send(
@@ -503,9 +629,21 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         return
 
     gconf = config_serveur(member.guild.id)
+    a_change_de_salon = before.channel != after.channel
+
+    # ── Quitte un hub sans avoir choisi → on annule le menu en attente ──
+    if before.channel and a_change_de_salon and str(before.channel.id) in gconf["hubs"]:
+        vue = choix_en_cours.pop((member.guild.id, member.id), None)
+        if vue:
+            vue.stop()
+            if vue.message:
+                try:
+                    await vue.message.delete()
+                except discord.HTTPException:
+                    pass
 
     # ── Rejoint un salon hub ────────────────────────────────
-    if after.channel and str(after.channel.id) in gconf["hubs"] and before.channel != after.channel:
+    if after.channel and a_change_de_salon and str(after.channel.id) in gconf["hubs"]:
         types_du_hub = gconf["hubs"][str(after.channel.id)].get("types", [])
         types_disponibles = {n: gconf["types"][n] for n in types_du_hub if n in gconf["types"]}
 
@@ -514,42 +652,69 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 f"Hub {after.channel.id} rejoint par {member.id} mais aucun type de vocal "
                 f"n'est disponible dans ce hub sur le serveur {member.guild.id} (utilise /vocal config)."
             )
-            return  # aucun type disponible dans ce hub, on ne fait rien
-
-        embed = discord.Embed(
-            title="🎙️ Choisis ton type de vocal",
-            description=(
-                f"{member.mention}, sélectionne le type de vocal que tu veux créer ci-dessous.\n"
-                f"⏱️ Tu as **{DUREE_CHOIX} secondes**, sinon tu seras déconnecté."
-            ),
-            color=0xFFD700,
-        )
-        view = ChoixTypeView(member, types_disponibles)
-        try:
-            msg = await after.channel.send(
-                content=member.mention,
-                embed=embed,
-                view=view,
-                allowed_mentions=discord.AllowedMentions(users=[member]),
+        else:
+            embed = discord.Embed(
+                title="🎙️ Choisis ton type de vocal",
+                description=(
+                    f"{member.mention}, sélectionne le type de vocal que tu veux créer ci-dessous.\n"
+                    f"⏱️ Tu as **{DUREE_CHOIX} secondes**, sinon tu seras déconnecté."
+                ),
+                color=0xFFD700,
             )
-            view.message = msg
-        except discord.Forbidden:
-            logging.warning(
-                f"Permission refusée pour envoyer un message dans le hub {after.channel.id} "
-                f"(serveur {member.guild.id}) — vérifie que le bot peut écrire dans ce salon vocal."
-            )
+            view = ChoixTypeView(member, types_disponibles, after.channel.id)
+            try:
+                msg = await after.channel.send(
+                    content=member.mention,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions(users=[member]),
+                )
+                view.message = msg
+                choix_en_cours[(member.guild.id, member.id)] = view
+            except discord.Forbidden:
+                logging.warning(
+                    f"Permission refusée pour envoyer un message dans le hub {after.channel.id} "
+                    f"(serveur {member.guild.id}) — vérifie que le bot peut écrire dans ce salon vocal."
+                )
+            except discord.HTTPException:
+                logging.exception("Impossible d'envoyer le menu de choix dans le hub.")
 
-    # ── Quitte un vocal temporaire → suppression si vide ────
-    if before.channel and str(before.channel.id) in gconf["temp_channels"]:
+    # ── Quitte un vocal temporaire → suppression si vide / transfert de propriété ────
+    if before.channel and a_change_de_salon and str(before.channel.id) in gconf["temp_channels"]:
         await asyncio.sleep(DELAI_NETTOYAGE)
+        cid = str(before.channel.id)
         salon = member.guild.get_channel(before.channel.id)
-        if salon and len(salon.members) == 0:
-            gconf["temp_channels"].pop(str(before.channel.id), None)
+
+        if not salon:
+            if gconf["temp_channels"].pop(cid, None) is not None:
+                sauvegarder_configuration()
+            return
+
+        if len(salon.members) == 0:
+            gconf["temp_channels"].pop(cid, None)
             sauvegarder_configuration()
             try:
                 await salon.delete(reason="Vocal temporaire vide")
             except discord.HTTPException:
                 pass
+            return
+
+        # Le propriétaire est parti mais il reste du monde → on transfère la propriété
+        info = gconf["temp_channels"].get(cid)
+        if info and info["owner_id"] == member.id and member not in salon.members:
+            candidats = [m for m in salon.members if not m.bot]
+            if candidats:
+                nouveau_proprio = candidats[0]
+                info["owner_id"] = nouveau_proprio.id
+                sauvegarder_configuration()
+                try:
+                    await salon.set_permissions(nouveau_proprio, view_channel=True, connect=True)
+                    await salon.send(
+                        f"👑 {nouveau_proprio.mention} est maintenant le propriétaire de ce vocal.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -571,9 +736,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 # ═══════════════════════════════════════════════════════════
 #  GROUPE DE COMMANDES  /vocal ...
-#  (toute la gestion des types/hubs passe désormais par /vocal config)
+#  (toute la gestion des types/hubs passe par /vocal config)
+#  guild_only : en MP, guild_id vaut None et casserait la config
 # ═══════════════════════════════════════════════════════════
-groupe_vocal = app_commands.Group(name="vocal", description="Système de vocaux temporaires")
+groupe_vocal = app_commands.Group(
+    name="vocal", description="Système de vocaux temporaires", guild_only=True
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -581,7 +749,7 @@ groupe_vocal = app_commands.Group(name="vocal", description="Système de vocaux 
 # ═══════════════════════════════════════════════════════════
 def embed_config(gconf: dict) -> discord.Embed:
     types_txt = "\n".join(
-        f"{emoji_type(i)} **{n}** — limite {i['limite'] or '∞'} · nom {'✅' if i.get('modifiable_nom') else '❌'} · "
+        f"{emoji_type(i)} **{n}** — limite {i.get('limite') or '∞'} · nom {'✅' if i.get('modifiable_nom') else '❌'} · "
         f"limite {'✅' if i.get('modifiable_limite') else '❌'} · masqué par défaut {'✅' if i.get('masque_defaut') else '❌'}"
         for n, i in gconf["types"].items()
     ) or "_Aucun type créé_"
@@ -607,6 +775,21 @@ def embed_config(gconf: dict) -> discord.Embed:
     embed.add_field(name="Mots interdits", value=banwords_txt[:1024], inline=False)
     embed.set_footer(text="Panneau valable 5 minutes • Visible uniquement par toi")
     return embed
+
+
+async def maj_panneau(interaction: discord.Interaction, embed: discord.Embed, vue: "VueBase"):
+    """Met à jour le message du panneau, que l'interaction ait été différée (defer) ou non,
+    et mémorise le message dans la vue pour le désactiver au timeout."""
+    if interaction.response.is_done():
+        vue.message = await interaction.edit_original_response(embed=embed, view=vue)
+    else:
+        await interaction.response.edit_message(embed=embed, view=vue)
+        vue.message = interaction.message
+
+
+async def retour_config(interaction: discord.Interaction, guild_id: int, auteur_id: int):
+    gconf = config_serveur(guild_id)
+    await maj_panneau(interaction, embed_config(gconf), VueConfig(guild_id, auteur_id))
 
 
 class VueBase(discord.ui.View):
@@ -679,6 +862,9 @@ class TypeModal(discord.ui.Modal, title="Nouveau type de vocal"):
     async def on_submit(self, interaction: discord.Interaction):
         gconf = config_serveur(self.guild_id)
         nom_val = self.nom.value.strip()
+        if not nom_val:
+            await interaction.response.send_message("❌ Le nom du type ne peut pas être vide.", ephemeral=True)
+            return
 
         conflit = any(
             t.lower() == nom_val.lower() and t != self.type_existant
@@ -695,6 +881,24 @@ class TypeModal(discord.ui.Modal, title="Nouveau type de vocal"):
 
         format_val = self.format_nom.value.strip() or "🔊 {type} de {pseudo}"
         emoji_val = self.emoji.value.strip()
+
+        # Un emoji invalide ferait refuser le menu de choix par Discord (400 Bad Request)
+        if not emoji_valide(emoji_val):
+            await interaction.response.send_message(
+                "❌ Emoji invalide : utilise un emoji Unicode ou un emoji personnalisé `<:nom:id>`.",
+                ephemeral=True,
+            )
+            return
+
+        # Un format contenant un autre {champ} ferait planter la création du vocal
+        try:
+            format_val.format(pseudo="test", type="test")
+        except (KeyError, IndexError, ValueError):
+            await interaction.response.send_message(
+                "❌ Format du nom invalide : seuls `{pseudo}` et `{type}` sont autorisés.",
+                ephemeral=True,
+            )
+            return
 
         # Si le type est renommé, on met à jour les hubs qui le référencent
         if self.type_existant and self.type_existant != nom_val:
@@ -714,9 +918,7 @@ class TypeModal(discord.ui.Modal, title="Nouveau type de vocal"):
         }
         sauvegarder_configuration()
 
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 class OptionsTypeView(VueBase):
@@ -805,10 +1007,7 @@ class OptionsTypeView(VueBase):
         )
 
     async def _annuler(self, interaction: discord.Interaction):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Étape : suppression d'un type (Select) ──────────────────
@@ -825,9 +1024,7 @@ class SelectTypeASupprimer(discord.ui.Select):
             if self.values[0] in hub_info.get("types", []):
                 hub_info["types"].remove(self.values[0])
         sauvegarder_configuration()
-        vue = VueConfig(self.guild_id, self.view.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.view.auteur_id)
 
 
 class VueSupprimerType(VueBase):
@@ -837,10 +1034,7 @@ class VueSupprimerType(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Étape : modifier un type existant ───────────────────────
@@ -866,18 +1060,15 @@ class SelectTypeAModifier(discord.ui.Select):
             modifiable_limite=info.get("modifiable_limite", False),
             masque_defaut=info.get("masque_defaut", False),
         )
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title=f"✏️ Modifier « {nom} » — options",
-                description=(
-                    "Ajuste les options ci-dessous, puis clique sur **Continuer** pour modifier "
-                    "le nom, la limite, l'emoji et le format de nom du type."
-                ),
-                color=0xFFD700,
+        embed = discord.Embed(
+            title=f"✏️ Modifier « {nom} » — options",
+            description=(
+                "Ajuste les options ci-dessous, puis clique sur **Continuer** pour modifier "
+                "le nom, la limite, l'emoji et le format de nom du type."
             ),
-            view=vue,
+            color=0xFFD700,
         )
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed, vue)
 
 
 class VueModifierType(VueBase):
@@ -887,10 +1078,7 @@ class VueModifierType(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Étape : nouveau hub (salon existant OU modal) ───────────
@@ -904,15 +1092,19 @@ class HubModal(discord.ui.Modal, title="Nouveau salon hub"):
         self.categorie_id = categorie_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         gconf = config_serveur(self.guild_id)
         categorie = interaction.guild.get_channel(self.categorie_id) if self.categorie_id else None
-        salon = await interaction.guild.create_voice_channel(name=self.nom.value.strip()[:100], category=categorie)
+        nom = self.nom.value.strip()[:100] or "➕ Créer un vocal"
+        try:
+            salon = await interaction.guild.create_voice_channel(name=nom, category=categorie)
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Impossible de créer le salon (permissions ?).", ephemeral=True)
+            return
         gconf["hubs"][str(salon.id)] = {"types": list(gconf["types"].keys())}
         sauvegarder_configuration()
 
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 class SelectSalonExistant(discord.ui.ChannelSelect):
@@ -935,13 +1127,16 @@ class SelectSalonExistant(discord.ui.ChannelSelect):
         if str(salon.id) in gconf["hubs"]:
             await interaction.response.send_message(f"❌ {salon.mention} est déjà un hub.", ephemeral=True)
             return
+        if str(salon.id) in gconf["temp_channels"]:
+            await interaction.response.send_message(
+                f"❌ {salon.mention} est un vocal temporaire, il ne peut pas devenir un hub.", ephemeral=True
+            )
+            return
 
         gconf["hubs"][str(salon.id)] = {"types": list(gconf["types"].keys())}
         sauvegarder_configuration()
 
-        vue = VueConfig(self.guild_id, self.view.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.view.auteur_id)
 
 
 class SelectCategorieHub(discord.ui.ChannelSelect):
@@ -978,30 +1173,24 @@ class VueNouveauHub(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Étape : suppression d'un hub (Select) ───────────────────
 class SelectHubASupprimer(discord.ui.Select):
     def __init__(self, guild_id: int, gconf: dict, guild: discord.Guild):
         self.guild_id = guild_id
-        options = []
-        for cid in gconf["hubs"]:
-            salon = guild.get_channel(int(cid))
-            if salon:
-                options.append(discord.SelectOption(label=salon.name, value=cid, emoji="🎙️"))
+        options = [
+            discord.SelectOption(label=salon.name[:100], value=cid, emoji="🎙️")
+            for cid, salon in hubs_valides(guild, gconf)
+        ]
         super().__init__(placeholder="Choisis le hub à supprimer...", options=options[:25], min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         gconf = config_serveur(self.guild_id)
         gconf["hubs"].pop(self.values[0], None)
         sauvegarder_configuration()
-        vue = VueConfig(self.guild_id, self.view.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.view.auteur_id)
 
 
 class VueSupprimerHub(VueBase):
@@ -1011,10 +1200,7 @@ class VueSupprimerHub(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Étape : types disponibles + catégorie cible pour un hub ────
@@ -1024,8 +1210,8 @@ class SelectTypesHub(discord.ui.Select):
         self.hub_id = hub_id
         actuels = set(gconf["hubs"].get(hub_id, {}).get("types", []))
         options = [
-            discord.SelectOption(label=n, value=n, emoji="🔊", default=(n in actuels))
-            for n in gconf["types"]
+            discord.SelectOption(label=n, value=n, emoji=emoji_type(info), default=(n in actuels))
+            for n, info in gconf["types"].items()
         ][:25]
         super().__init__(
             placeholder="Choisis les types disponibles pour ce hub...",
@@ -1039,9 +1225,7 @@ class SelectTypesHub(discord.ui.Select):
         gconf = config_serveur(self.guild_id)
         gconf["hubs"].setdefault(self.hub_id, {})["types"] = list(self.values)
         sauvegarder_configuration()
-        vue = VueConfig(self.guild_id, self.view.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.view.auteur_id)
 
 
 class SelectCategorieCible(discord.ui.ChannelSelect):
@@ -1085,20 +1269,16 @@ class VueTypesHub(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 class SelectHubPourTypes(discord.ui.Select):
     def __init__(self, guild_id: int, gconf: dict, guild: discord.Guild):
         self.guild_id = guild_id
-        options = []
-        for cid in gconf["hubs"]:
-            salon = guild.get_channel(int(cid))
-            if salon:
-                options.append(discord.SelectOption(label=salon.name, value=cid, emoji="🎙️"))
+        options = [
+            discord.SelectOption(label=salon.name[:100], value=cid, emoji="🎙️")
+            for cid, salon in hubs_valides(guild, gconf)
+        ]
         super().__init__(placeholder="Choisis le hub à configurer...", options=options[:25], min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -1107,21 +1287,17 @@ class SelectHubPourTypes(discord.ui.Select):
         cat_cible_id = gconf["hubs"].get(self.values[0], {}).get("categorie_cible")
         cat_cible = interaction.guild.get_channel(int(cat_cible_id)) if cat_cible_id else None
         vue = VueTypesHub(self.guild_id, self.view.auteur_id, self.values[0], gconf)
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title=f"🔀 Configuration — {salon.name if salon else '#' + self.values[0]}",
-                description=(
-                    "Sélectionne les types de vocaux disponibles dans ce hub (les types non cochés "
-                    "n'apparaîtront pas dans son menu), et choisis dans quelle catégorie Discord "
-                    "les vocaux créés depuis ce hub doivent être placés.\n\n"
-                    f"**Catégorie cible actuelle :** {cat_cible.mention if cat_cible else 'catégorie du hub (par défaut)'}"
-                ),
-                color=0xFFD700,
+        embed = discord.Embed(
+            title=f"🔀 Configuration — {salon.name if salon else '#' + self.values[0]}",
+            description=(
+                "Sélectionne les types de vocaux disponibles dans ce hub (les types non cochés "
+                "n'apparaîtront pas dans son menu), et choisis dans quelle catégorie Discord "
+                "les vocaux créés depuis ce hub doivent être placés.\n\n"
+                f"**Catégorie cible actuelle :** {cat_cible.mention if cat_cible else 'catégorie du hub (par défaut)'}"
             ),
-            view=vue,
+            color=0xFFD700,
         )
-        vue.message = interaction.message
-
+        await maj_panneau(interaction, embed, vue)
 
 
 class VueChoixHubTypes(VueBase):
@@ -1131,10 +1307,7 @@ class VueChoixHubTypes(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1150,11 +1323,24 @@ def embed_categorie(categorie: discord.CategoryChannel, gconf: dict) -> discord.
 
     embed = discord.Embed(
         title=f"📁 {categorie.name}",
-        description="Gère cette catégorie : renommage et accès par rôle.\nS'applique aussi aux vocaux déjà présents dans cette catégorie.",
+        description=(
+            "Gère cette catégorie : renommage et accès par rôle.\n"
+            "S'applique aussi aux salons déjà présents dans cette catégorie "
+            "(hors vocaux temporaires en cours, qui gardent leurs réglages)."
+        ),
         color=0xFFD700,
     )
     embed.add_field(name="Accès", value=acces, inline=False)
     return embed
+
+
+async def synchroniser_vocaux_categorie(categorie: discord.CategoryChannel, gconf: dict):
+    """Resynchronise les permissions des vocaux de la catégorie, sauf les vocaux temporaires
+    (sinon on écraserait les droits du créateur et l'état masqué/verrouillé)."""
+    for salon in categorie.voice_channels:
+        if str(salon.id) in gconf["temp_channels"]:
+            continue
+        await salon.edit(sync_permissions=True)
 
 
 class RenommerCategorieModal(discord.ui.Modal, title="Renommer la catégorie"):
@@ -1167,16 +1353,24 @@ class RenommerCategorieModal(discord.ui.Modal, title="Renommer la catégorie"):
         self.categorie_id = categorie_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         categorie = interaction.guild.get_channel(self.categorie_id)
         if not categorie:
-            await interaction.response.send_message("❌ Catégorie introuvable.", ephemeral=True)
+            await interaction.followup.send("❌ Catégorie introuvable.", ephemeral=True)
             return
-        await categorie.edit(name=self.nouveau_nom.value[:100])
+        nom = self.nouveau_nom.value.strip()[:100]
+        if not nom:
+            await interaction.followup.send("❌ Le nom ne peut pas être vide.", ephemeral=True)
+            return
+        try:
+            await categorie.edit(name=nom)
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Impossible de renommer la catégorie.", ephemeral=True)
+            return
 
         gconf = config_serveur(self.guild_id)
         vue = VueGererCategorie(self.guild_id, self.auteur_id, str(self.categorie_id))
-        await interaction.response.edit_message(embed=embed_categorie(categorie, gconf), view=vue)
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed_categorie(categorie, gconf), vue)
 
 
 class SelectRolesCategorie(discord.ui.RoleSelect):
@@ -1191,31 +1385,37 @@ class SelectRolesCategorie(discord.ui.RoleSelect):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()  # plusieurs appels API → on évite l'expiration des 3 s
         gconf = config_serveur(self.guild_id)
         categorie = interaction.guild.get_channel(int(self.categorie_id))
         if not categorie:
-            await interaction.response.send_message("❌ Catégorie introuvable.", ephemeral=True)
+            await interaction.followup.send("❌ Catégorie introuvable.", ephemeral=True)
             return
 
-        overwrites = dict(categorie.overwrites)
-        overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        overwrites = copie_overwrites(categorie)
+        # On modifie l'overwrite existant de @everyone au lieu de le remplacer
+        # (sinon on perd ses autres permissions)
+        ow_everyone = overwrites.get(interaction.guild.default_role, discord.PermissionOverwrite())
+        ow_everyone.view_channel = False
+        overwrites[interaction.guild.default_role] = ow_everyone
         for role in self.values:
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            ow = overwrites.get(role, discord.PermissionOverwrite())
+            ow.view_channel = True
+            ow.connect = True
+            overwrites[role] = ow
 
         try:
             await categorie.edit(overwrites=overwrites)
-            for salon in categorie.voice_channels:
-                await salon.edit(sync_permissions=True)
+            await synchroniser_vocaux_categorie(categorie, gconf)
         except discord.HTTPException:
-            await interaction.response.send_message("❌ Impossible de modifier les permissions.", ephemeral=True)
+            await interaction.followup.send("❌ Impossible de modifier les permissions.", ephemeral=True)
             return
 
         gconf["categories"][self.categorie_id] = {"roles": [str(r.id) for r in self.values]}
         sauvegarder_configuration()
 
         vue = VueGererCategorie(self.guild_id, self.view.auteur_id, self.categorie_id)
-        await interaction.response.edit_message(embed=embed_categorie(categorie, gconf), view=vue)
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed_categorie(categorie, gconf), vue)
 
 
 class VueGererCategorie(VueBase):
@@ -1243,34 +1443,41 @@ class VueGererCategorie(VueBase):
             await interaction.response.send_message("❌ Cette catégorie n'a pas de restriction configurée.", ephemeral=True)
             return
 
-        overwrites = dict(categorie.overwrites)
-        overwrites.pop(interaction.guild.default_role, None)
+        await interaction.response.defer()
+
+        overwrites = copie_overwrites(categorie)
+        # On retire seulement ce que la restriction avait ajouté, sans toucher aux autres permissions
+        cibles = [interaction.guild.default_role]
         for rid in info.get("roles", []):
             role = interaction.guild.get_role(int(rid))
             if role:
-                overwrites.pop(role, None)
+                cibles.append(role)
+        for cible in cibles:
+            ow = overwrites.get(cible)
+            if ow is None:
+                continue
+            ow.view_channel = None
+            if cible != interaction.guild.default_role:
+                ow.connect = None
+            if ow.is_empty():
+                overwrites.pop(cible, None)
 
         try:
             await categorie.edit(overwrites=overwrites)
-            for salon in categorie.voice_channels:
-                await salon.edit(sync_permissions=True)
+            await synchroniser_vocaux_categorie(categorie, gconf)
         except discord.HTTPException:
-            await interaction.response.send_message("❌ Impossible de modifier les permissions.", ephemeral=True)
+            await interaction.followup.send("❌ Impossible de modifier les permissions.", ephemeral=True)
             return
 
         gconf["categories"].pop(self.categorie_id, None)
         sauvegarder_configuration()
 
         vue = VueGererCategorie(self.guild_id, self.auteur_id, self.categorie_id)
-        await interaction.response.edit_message(embed=embed_categorie(categorie, gconf), view=vue)
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed_categorie(categorie, gconf), vue)
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 class SelectCategorieAGerer(discord.ui.ChannelSelect):
@@ -1290,8 +1497,7 @@ class SelectCategorieAGerer(discord.ui.ChannelSelect):
             await interaction.response.send_message("❌ Catégorie introuvable.", ephemeral=True)
             return
         vue = VueGererCategorie(self.guild_id, self.view.auteur_id, str(categorie.id))
-        await interaction.response.edit_message(embed=embed_categorie(categorie, gconf), view=vue)
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed_categorie(categorie, gconf), vue)
 
 
 class VueChoixCategorie(VueBase):
@@ -1301,10 +1507,7 @@ class VueChoixCategorie(VueBase):
 
     @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
     async def retour(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gconf = config_serveur(self.guild_id)
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1329,9 +1532,7 @@ class BanwordsModal(discord.ui.Modal, title="Mots interdits (renommage)"):
         gconf["banwords"] = [m.strip().lower() for m in self.mots.value.split(",") if m.strip()]
         sauvegarder_configuration()
 
-        vue = VueConfig(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(embed=embed_config(gconf), view=vue)
-        vue.message = interaction.message
+        await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
 # ── Panneau principal ────────────────────────────────────────
@@ -1342,18 +1543,15 @@ class VueConfig(VueBase):
     @discord.ui.button(label="Nouveau type", style=discord.ButtonStyle.success, emoji="➕", row=0)
     async def bouton_nouveau_type(self, interaction: discord.Interaction, button: discord.ui.Button):
         vue = OptionsTypeView(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="➕ Nouveau type — options",
-                description=(
-                    "Règle les options ci-dessous, puis clique sur **Continuer** pour saisir "
-                    "le nom, la limite, l'emoji et le format de nom du type."
-                ),
-                color=0xFFD700,
+        embed = discord.Embed(
+            title="➕ Nouveau type — options",
+            description=(
+                "Règle les options ci-dessous, puis clique sur **Continuer** pour saisir "
+                "le nom, la limite, l'emoji et le format de nom du type."
             ),
-            view=vue,
+            color=0xFFD700,
         )
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Modifier un type", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
     async def bouton_modifier_type(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1362,11 +1560,8 @@ class VueConfig(VueBase):
             await interaction.response.send_message("❌ Aucun type à modifier.", ephemeral=True)
             return
         vue = VueModifierType(self.guild_id, self.auteur_id, gconf)
-        await interaction.response.edit_message(
-            embed=discord.Embed(title="✏️ Modifier un type", description="Choisis le type à modifier.", color=0xFFD700),
-            view=vue,
-        )
-        vue.message = interaction.message
+        embed = discord.Embed(title="✏️ Modifier un type", description="Choisis le type à modifier.", color=0xFFD700)
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Supprimer un type", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
     async def bouton_supprimer_type(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1375,11 +1570,8 @@ class VueConfig(VueBase):
             await interaction.response.send_message("❌ Aucun type à supprimer.", ephemeral=True)
             return
         vue = VueSupprimerType(self.guild_id, self.auteur_id, gconf)
-        await interaction.response.edit_message(
-            embed=discord.Embed(title="🗑️ Supprimer un type", description="Choisis le type à retirer.", color=0xFF4444),
-            view=vue,
-        )
-        vue.message = interaction.message
+        embed = discord.Embed(title="🗑️ Supprimer un type", description="Choisis le type à retirer.", color=0xFF4444)
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Nouveau hub", style=discord.ButtonStyle.success, emoji="🎙️", row=1)
     async def bouton_nouveau_hub(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1390,65 +1582,53 @@ class VueConfig(VueBase):
             )
             return
         vue = VueNouveauHub(self.guild_id, self.auteur_id, interaction.guild)
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="🎙️ Nouveau hub",
-                description=(
-                    "Choisis un salon vocal existant à transformer, une catégorie pour le nouveau "
-                    "salon (optionnel), ou crée-en un nouveau directement. Le nouveau hub reçoit "
-                    "automatiquement tous les types existants — modifiable ensuite via **Types par hub**."
-                ),
-                color=0x00FF88,
+        embed = discord.Embed(
+            title="🎙️ Nouveau hub",
+            description=(
+                "Choisis un salon vocal existant à transformer, une catégorie pour le nouveau "
+                "salon (optionnel), ou crée-en un nouveau directement. Le nouveau hub reçoit "
+                "automatiquement tous les types existants — modifiable ensuite via **Configurer un hub**."
             ),
-            view=vue,
+            color=0x00FF88,
         )
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Supprimer un hub", style=discord.ButtonStyle.danger, emoji="🚫", row=1)
     async def bouton_supprimer_hub(self, interaction: discord.Interaction, button: discord.ui.Button):
         gconf = config_serveur(self.guild_id)
-        if not gconf["hubs"]:
+        if not hubs_valides(interaction.guild, gconf):
             await interaction.response.send_message("❌ Aucun hub à supprimer.", ephemeral=True)
             return
         vue = VueSupprimerHub(self.guild_id, self.auteur_id, gconf, interaction.guild)
-        await interaction.response.edit_message(
-            embed=discord.Embed(title="🚫 Supprimer un hub", description="Choisis le hub à retirer.", color=0xFF4444),
-            view=vue,
-        )
-        vue.message = interaction.message
+        embed = discord.Embed(title="🚫 Supprimer un hub", description="Choisis le hub à retirer.", color=0xFF4444)
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Configurer un hub", style=discord.ButtonStyle.primary, emoji="🔀", row=1)
     async def bouton_types_hub(self, interaction: discord.Interaction, button: discord.ui.Button):
         gconf = config_serveur(self.guild_id)
-        if not gconf["hubs"]:
+        if not hubs_valides(interaction.guild, gconf):
             await interaction.response.send_message("❌ Crée d'abord au moins un hub.", ephemeral=True)
             return
         if not gconf["types"]:
             await interaction.response.send_message("❌ Crée d'abord au moins un type de vocal.", ephemeral=True)
             return
         vue = VueChoixHubTypes(self.guild_id, self.auteur_id, gconf, interaction.guild)
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="🔀 Configurer un hub",
-                description="Choisis le hub à configurer (types disponibles et catégorie cible).",
-                color=0xFFD700,
-            ),
-            view=vue,
+        embed = discord.Embed(
+            title="🔀 Configurer un hub",
+            description="Choisis le hub à configurer (types disponibles et catégorie cible).",
+            color=0xFFD700,
         )
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Gérer une catégorie", style=discord.ButtonStyle.primary, emoji="📁", row=2)
     async def bouton_gerer_categorie(self, interaction: discord.Interaction, button: discord.ui.Button):
         vue = VueChoixCategorie(self.guild_id, self.auteur_id)
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="📁 Gérer une catégorie",
-                description="Choisis la catégorie Discord à renommer ou à restreindre par rôle.",
-                color=0xFFD700,
-            ),
-            view=vue,
+        embed = discord.Embed(
+            title="📁 Gérer une catégorie",
+            description="Choisis la catégorie Discord à renommer ou à restreindre par rôle.",
+            color=0xFFD700,
         )
-        vue.message = interaction.message
+        await maj_panneau(interaction, embed, vue)
 
     @discord.ui.button(label="Mots interdits", style=discord.ButtonStyle.danger, emoji="🚫", row=2)
     async def bouton_banwords(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1483,7 +1663,6 @@ async def vocal_config(interaction: discord.Interaction):
 # ═══════════════════════════════════════════════════════════
 #  PANEL D'INVITATION
 # ═══════════════════════════════════════════════════════════
-
 class InviteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1496,6 +1675,7 @@ class InviteView(discord.ui.View):
                 url=LIEN_INVITATION,
             )
         )
+
 
 # ═══════════════════════════════════════════════════════════
 #  AIDE — /help avec panel interactif
@@ -1558,7 +1738,8 @@ CMDS = {
             "Choisis une catégorie existante pour la renommer, ou pour la restreindre à un ou "
             "plusieurs rôles : la catégorie et les vocaux qu'elle contient (y compris ceux créés "
             "ensuite via un hub ciblant cette catégorie) deviennent invisibles pour tout le monde "
-            "sauf les rôles choisis. **Retirer la restriction** rétablit l'accès normal du serveur."
+            "sauf les rôles choisis. Les vocaux temporaires déjà en cours gardent leurs réglages. "
+            "**Retirer la restriction** rétablit l'accès normal du serveur."
         ),
     },
     "mots interdits": {
@@ -1586,7 +1767,9 @@ CMDS = {
             "**🙈 Masquer / 👁️ Afficher** — cache le vocal pour tout le monde sauf toi.\n"
             "**🔒 Verrouiller / 🔓 Déverrouiller** — empêche quiconque de te rejoindre (sans "
             "déconnecter les membres déjà présents).\n\n"
-            "Ces deux derniers boutons sont utilisables uniquement par le créateur du vocal."
+            "Ces boutons sont utilisables uniquement par le créateur du vocal. Si le créateur "
+            "quitte le vocal alors qu'il reste du monde, la propriété est transférée "
+            "automatiquement au premier membre présent."
         ),
     },
 }
@@ -1652,7 +1835,7 @@ class AideSelect(discord.ui.Select):
                 description=info["desc"],
                 color=0xFFD700,
             )
-            embed.add_field(name="📖 Détails", value=info["details"], inline=False)
+            embed.add_field(name="📖 Détails", value=info["details"][:1024], inline=False)
             embed.set_footer(text=f"Catégorie : {info['categorie']} • Reviens à la vue d'ensemble dans le menu")
 
         await interaction.response.edit_message(embed=embed, view=self.view)
@@ -1684,16 +1867,19 @@ async def help_cmd(interaction: discord.Interaction):
 
 arbre.add_command(groupe_vocal)
 
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     if bot.user in message.mentions:
+        # Les emojis personnalisés ne s'affichent pas dans les titres d'embed :
+        # on les place dans la description et les champs.
         embed = discord.Embed(
-            title="<a:r2:1485268957664383038> Beflow",
+            title="Beflow",
             description=(
-                "Salut ! Je suis **Beflow**.\n\n"
+                "<a:r2:1485268957664383038> Salut ! Je suis **Beflow**.\n\n"
                 "Je crée automatiquement des **vocaux temporaires** entièrement configurables.\n\n"
                 "Clique sur le bouton ci-dessous pour m'ajouter à ton serveur."
             ),
@@ -1701,7 +1887,7 @@ async def on_message(message: discord.Message):
         )
 
         embed.add_field(
-            name="<a:mangerr:1485359165516939356> Fonctionnalités",
+            name="Fonctionnalités",
             value=(
                 "<a:ar:1485250353854288035> Vocaux temporaires\n"
                 "<a:ar:1485250353854288035> Types de salons\n"
@@ -1714,13 +1900,20 @@ async def on_message(message: discord.Message):
 
         embed.set_footer(text="Développé par Bebefirm1")
 
-        await message.reply(
-            embed=embed,
-            view=InviteView(),
-            mention_author=False,
-        )
+        try:
+            await message.reply(
+                embed=embed,
+                view=InviteView(),
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
 
     await bot.process_commands(message)
+
+
+if not TOKEN:
+    raise SystemExit("TOKEN_BOT introuvable : vérifie ton fichier .env")
 
 if KEEP_ALIVE_AVAILABLE:
     keep_alive()
