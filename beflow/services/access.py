@@ -1,8 +1,3 @@
-"""Safe, reversible per-target Discord permission overwrite modifications.
-
-We only touch view_channel/connect bits; other overwrites survive unchanged.
-Exceptions: the Discord ADMINISTRATOR permission cannot be overridden.
-"""
 from __future__ import annotations
 import discord
 
@@ -42,14 +37,16 @@ def restore_field(overwrites, guild, field: str, snapshots: dict) -> dict:
     return overwrites
 
 
-def apply_channel_restriction(overwrites: dict, guild, field: str, owner_id: int) -> tuple[dict, dict]:
+def apply_channel_restriction(overwrites: dict, guild, field: str, owner_id: int,
+                              exempt_member_ids=None) -> tuple[dict, dict]:
     """Deny everyone, strip explicit allowances on other roles/members.
 
     Returns (new overwrites, snapshot). To undo, pass snapshot to restore_field.
     """
     snapshot = {}
+    exempt_ids = set(exempt_member_ids or ())
     for target, overwrite in list(overwrites.items()):
-        if target.id == owner_id and not isinstance(target, discord.Role):
+        if not isinstance(target, discord.Role) and (target.id == owner_id or target.id in exempt_ids):
             continue
         previous = getattr(overwrite, field)
         if target.id == guild.default_role.id or previous is True:
