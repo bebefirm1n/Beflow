@@ -7,7 +7,11 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 from beflow.storage import ConfigStore
+# Import facultatif : seule une base PostgreSQL utilise ce module.
 from beflow.services.lifecycle import creation_locks, channel_locks, creation_cooldowns
+from beflow.services.panel_controls import (PANEL_FEATURES, panel_features,
+                                             feature_enabled, toggle_feature,
+                                             guest_access)
 from beflow.services.access import (clone_overwrites, apply_channel_restriction, restore_field,
                                     restrict_category, identity)
 
@@ -42,7 +46,13 @@ DELAI_NETTOYAGE = 3         # secondes d'attente avant de vérifier si un vocal 
 DELAI_SUPPRESSION_MSG = 20  # secondes avant de supprimer le message une fois le résultat connu
 CONFIG_PATH = os.getenv("LEGACY_CONFIG_PATH", "vocaux_config.json")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/beflow.sqlite3")
-STORE = ConfigStore(DATABASE_PATH, CONFIG_PATH)
+if os.getenv("DATABASE_URL"):
+    from beflow.postgres_storage import PostgresConfigStore
+    STORE = PostgresConfigStore(os.environ["DATABASE_URL"], CONFIG_PATH)
+elif os.getenv("REQUIRE_POSTGRES") == "1":
+    raise RuntimeError("REQUIRE_POSTGRES=1 : DATABASE_URL est obligatoire sur Render gratuit")
+else:
+    STORE = ConfigStore(DATABASE_PATH, CONFIG_PATH)
 
 # ═══════════════════════════════════════════════════════════
 #  PERSISTENCE (fichier JSON simple : hubs, types, vocaux temp)
@@ -428,8 +438,11 @@ class PanelVocalView(discord.ui.View):
     courant (masque/verrou) pour que les libellés des boutons restent corrects.
     """
 
-    def __init__(self, masque: bool = False, verrou: bool = False):
+    def __init__(self, masque: bool = False, verrou: bool = False,
+                 features: dict | None = None):
         super().__init__(timeout=None)
+        # L'instance générique enregistrée au démarrage expose tous les custom_id.
+        features = features if features is not None else {k: True for k in PANEL_FEATURES}
 
         bouton_renommer = discord.ui.Button(
             label="Renommer", style=discord.ButtonStyle.primary, emoji="✏️",
@@ -462,6 +475,22 @@ class PanelVocalView(discord.ui.View):
         )
         bouton_verrou.callback = self.bouton_verrou
         self.add_item(bouton_verrou)
+
+        # Les boutons supplémentaires gardent leurs custom_id entre redémarrages.
+        # Désactiver un bouton côté UI ne remplace jamais le contrôle côté serveur.
+        for key, titre, emoji, style, callback in (
+            ("autoriser", "Autoriser", "✅", discord.ButtonStyle.success, self.bouton_autoriser),
+            ("expulser", "Expulser", "🚪", discord.ButtonStyle.danger, self.bouton_expulser),
+            ("transferer", "Transférer", "👑", discord.ButtonStyle.primary, self.bouton_transferer),
+            ("informations", "Informations", "ℹ️", discord.ButtonStyle.secondary, self.bouton_informations),
+        ):
+            button = discord.ui.Button(
+                label=titre, emoji=emoji, style=style,
+                custom_id=f"panel_vocal_{key}", row=1,
+                disabled=not features.get(key, True),
+            )
+            button.callback = callback
+            self.add_item(button)
 
     @staticmethod
     def _info(interaction: discord.Interaction):
@@ -522,7 +551,8 @@ class PanelVocalView(discord.ui.View):
             snapshots = info.setdefault("permission_snapshots", {})
             if nouvelle_valeur:
                 overwrites, state = apply_channel_restriction(
-                    overwrites, interaction.guild, permission, info["owner_id"])
+                    overwrites, interaction.guild, permission, info["owner_id"],
+                    exempt_member_ids=[int(uid) for uid in guest_access(info)])
                 snapshots[permission] = state
             else:
                 restore_field(overwrites, interaction.guild, permission,
@@ -541,7 +571,8 @@ class PanelVocalView(discord.ui.View):
                     embed=embed_panel_vocal(
                         info["type"], info.get("masque", False), info.get("verrou", False),
                         emoji=emoji_type(gconf["types"].get(info["type"], {}))),
-                    view=PanelVocalView(info.get("masque", False), info.get("verrou", False)))
+                    view=PanelVocalView(info.get("masque", False), info.get("verrou", False),
+                                        features=panel_features(gconf)))
             except discord.HTTPException:
                 logging.exception("Panneau impossible à actualiser : %s", salon.id)
         await interaction.followup.send("✅ Paramètre du vocal mis à jour.", ephemeral=True)
@@ -553,6 +584,229 @@ class PanelVocalView(discord.ui.View):
     async def bouton_verrou(self, interaction: discord.Interaction):
         if await self._verifier(interaction):
             await self._changer_etat(interaction, "verrou", "connect")
+
+    async def _ouvrir_membres(self, interaction: discord.Interaction, action: str):
+        if not await self._verifier(interaction):
+            return
+        if not feature_enabled(config_serveur(interaction.guild_id), action):
+            await interaction.response.send_message(
+                "❌ Cette fonction a été désactivée par les administrateurs.", ephemeral=True)
+            return
+        vue = SelectionMembreView(interaction.guild_id, interaction.channel_id,
+                                  interaction.user.id, action)
+        descriptions = {
+            "autoriser": "Sélectionne un membre pour lui donner accès au vocal privé. Sélectionne à nouveau un membre déjà invité pour lui retirer l'autorisation Beflow.",
+            "expulser": "Sélectionne un membre actuellement dans ton vocal pour le déconnecter. Il pourra revenir si le vocal est ouvert.",
+            "transferer": "Sélectionne un membre actuellement présent pour lui donner la propriété du vocal.",
+        }
+        await interaction.response.send_message(descriptions[action], view=vue, ephemeral=True)
+
+    async def bouton_autoriser(self, interaction: discord.Interaction):
+        await self._ouvrir_membres(interaction, "autoriser")
+
+    async def bouton_expulser(self, interaction: discord.Interaction):
+        await self._ouvrir_membres(interaction, "expulser")
+
+    async def bouton_transferer(self, interaction: discord.Interaction):
+        await self._ouvrir_membres(interaction, "transferer")
+
+    async def bouton_informations(self, interaction: discord.Interaction):
+        resultat = await self._verifier(interaction)
+        if not resultat:
+            return
+        gconf, info = resultat
+        if not feature_enabled(gconf, "informations"):
+            await interaction.response.send_message(
+                "❌ Cette fonction a été désactivée par les administrateurs.", ephemeral=True)
+            return
+        salon = interaction.channel
+        membres = [m for m in salon.members if not m.bot]
+        invites = list(guest_access(info))
+        limites = "Illimitée" if not salon.user_limit else str(salon.user_limit)
+        embed = discord.Embed(title="ℹ️ Informations du vocal", color=0x5865F2)
+        embed.add_field(name="Salon", value=salon.name[:100], inline=False)
+        embed.add_field(name="Type", value=info.get("type", "Inconnu"), inline=True)
+        embed.add_field(name="Propriétaire", value=f"<@{info['owner_id']}>", inline=True)
+        embed.add_field(name="Membres", value=f"{len(membres)} / {limites}", inline=True)
+        embed.add_field(name="Visibilité", value="Masqué" if info.get("masque") else "Visible", inline=True)
+        embed.add_field(name="Accès", value="Verrouillé" if info.get("verrou") else "Ouvert", inline=True)
+        texte_invites = ", ".join(f"<@{uid}>" for uid in invites[:15]) if invites else "Aucune invitation individuelle"
+        if len(invites) > 15:
+            texte_invites += f" (+{len(invites) - 15} autres)"
+        embed.add_field(name="Accès individuels Beflow", value=texte_invites, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
+
+
+class SelectionMembre(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Choisir un membre du serveur...", min_values=1,
+                         max_values=1, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        vue = self.view
+        # Contrôle au moment de l'action (même après un transfert ou un changement de réglage).
+        if not await vue.controle(interaction):
+            return
+        cible_id = self.values[0].id
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with channel_locks.hold(vue.channel_id):
+            gconf = config_serveur(vue.guild_id)
+            info = gconf["temp_channels"].get(str(vue.channel_id))
+            if not info or info.get("owner_id") != vue.auteur_id or not feature_enabled(gconf, vue.action):
+                await interaction.followup.send("❌ Action annulée : les autorisations ont changé.", ephemeral=True)
+                return
+            if (not getattr(interaction.user, "voice", None) or not interaction.user.voice.channel
+                    or interaction.user.voice.channel.id != vue.channel_id):
+                await interaction.followup.send("❌ Tu n'es plus dans ton vocal.", ephemeral=True)
+                return
+            salon = interaction.guild.get_channel(vue.channel_id)
+            if not isinstance(salon, discord.VoiceChannel):
+                await interaction.followup.send("❌ Le salon n'existe plus.", ephemeral=True)
+                return
+            try:
+                cible = interaction.guild.get_member(cible_id)
+                if cible is None:
+                    cible = await interaction.guild.fetch_member(cible_id)
+            except discord.NotFound:
+                await interaction.followup.send("❌ Ce membre ne se trouve plus sur le serveur.", ephemeral=True)
+                return
+            except discord.HTTPException:
+                await interaction.followup.send("❌ Impossible de retrouver ce membre.", ephemeral=True)
+                return
+            if cible.bot:
+                await interaction.followup.send("❌ Sélectionne une personne, pas un bot.", ephemeral=True)
+                return
+            if cible.id == info["owner_id"]:
+                await interaction.followup.send("❌ Tu ne peux pas effectuer cette action sur toi-même.", ephemeral=True)
+                return
+
+            if vue.action == "autoriser":
+                try:
+                    salon_actuel = await interaction.guild.fetch_channel(salon.id)
+                    overwrites = copie_overwrites(salon_actuel)
+                    invites = guest_access(info)
+                    cle = str(cible.id)
+                    ancien = overwrites.get(cible, discord.PermissionOverwrite())
+                    if cle in invites:
+                        origine = invites[cle]
+                        ancien.view_channel = origine.get("view_channel")
+                        ancien.connect = origine.get("connect")
+                        if ancien.is_empty():
+                            overwrites.pop(cible, None)
+                        else:
+                            overwrites[cible] = ancien
+                        await salon_actuel.edit(overwrites=overwrites,
+                                                reason="Beflow : retrait accès individuel")
+                        invites.pop(cle, None)
+                        texte = f"✅ Autorisation Beflow retirée à {cible.display_name}."
+                    else:
+                        if salon.category:
+                            acces_categorie = salon.category.permissions_for(cible)
+                            if not (acces_categorie.view_channel and acces_categorie.connect):
+                                await interaction.followup.send(
+                                    "❌ Ce membre n'a pas accès à la catégorie. Une invitation ne peut pas contourner les restrictions des administrateurs.",
+                                    ephemeral=True)
+                                return
+                        # Ne pas contourner un refus explicite d'un rôle sur le salon,
+                        # hors refus @everyone posé par la fonction masquer/verrouiller.
+                        for role in cible.roles:
+                            if role.id == interaction.guild.default_role.id:
+                                continue
+                            role_ow = overwrites.get(role)
+                            if role_ow and (role_ow.view_channel is False or role_ow.connect is False):
+                                await interaction.followup.send(
+                                    "❌ Un rôle de ce membre possède un refus explicite sur ce salon.", ephemeral=True)
+                                return
+                        if len(invites) >= 75:
+                            await interaction.followup.send("❌ Limite de 75 invitations individuelles atteinte.", ephemeral=True)
+                            return
+                        origine = {"view_channel": ancien.view_channel, "connect": ancien.connect}
+                        ancien.view_channel = True
+                        ancien.connect = True
+                        overwrites[cible] = ancien
+                        await salon_actuel.edit(overwrites=overwrites,
+                                                reason="Beflow : autorisation individuelle")
+                        invites[cle] = origine
+                        texte = f"✅ {cible.display_name} peut rejoindre ton vocal, même s'il est masqué ou verrouillé."
+                    sauvegarder_configuration()
+                except discord.HTTPException:
+                    logging.exception("Erreur modification accès individuel vocal=%s cible=%s", salon.id, cible_id)
+                    await interaction.followup.send("❌ Discord a refusé la modification des permissions.", ephemeral=True)
+                    return
+            elif vue.action == "expulser":
+                if not any(m.id == cible.id for m in salon.members):
+                    await interaction.followup.send("❌ Cette personne n'est plus dans le vocal.", ephemeral=True)
+                    return
+                try:
+                    await cible.move_to(None, reason=f"Beflow : expulsion par {interaction.user.id}")
+                except discord.HTTPException:
+                    await interaction.followup.send("❌ Impossible d'expulser ce membre (permission Déplacer les membres ?).", ephemeral=True)
+                    return
+                texte = f"✅ {cible.display_name} a été déconnecté du vocal."
+            else:  # transferer
+                if not any(m.id == cible.id for m in salon.members):
+                    await interaction.followup.send("❌ Le futur propriétaire doit être présent dans le vocal.", ephemeral=True)
+                    return
+                try:
+                    await transfert_proprietaire(salon, info, cible)
+                except discord.HTTPException:
+                    logging.exception("Erreur transfert manuel %s", salon.id)
+                    await interaction.followup.send("❌ Impossible de transférer la propriété.", ephemeral=True)
+                    return
+                texte = f"✅ {cible.display_name} est maintenant propriétaire du vocal."
+            vue.stop()
+        await interaction.followup.send(texte, ephemeral=True,
+                                        allowed_mentions=discord.AllowedMentions.none())
+
+
+class SelectionMembreView(discord.ui.View):
+    def __init__(self, guild_id: int, channel_id: int, auteur_id: int, action: str):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.auteur_id = auteur_id
+        self.action = action
+        self.add_item(SelectionMembre())
+
+    async def controle(self, interaction: discord.Interaction) -> bool:
+        if (interaction.guild_id != self.guild_id or interaction.channel_id != self.channel_id
+                or interaction.user.id != self.auteur_id):
+            await interaction.response.send_message("❌ Cette sélection ne t'est pas destinée.", ephemeral=True)
+            return False
+        info = config_serveur(self.guild_id)["temp_channels"].get(str(self.channel_id))
+        if not info or info.get("owner_id") != self.auteur_id or not feature_enabled(config_serveur(self.guild_id), self.action):
+            await interaction.response.send_message("❌ Tu n'es plus autorisé à faire cela.", ephemeral=True)
+            return False
+        if (not getattr(interaction.user, "voice", None) or not interaction.user.voice.channel
+                or interaction.user.voice.channel.id != self.channel_id):
+            await interaction.response.send_message("❌ Tu dois rester dans ton vocal pour utiliser ce menu.", ephemeral=True)
+            return False
+        return True
+
+
+async def actualiser_panneau_vocal(salon, info, gconf):
+    """Répercute les options d'un serveur sur les panneaux dont l'ID est connu."""
+    mid = info.get("panel_message_id")
+    if not mid:
+        return
+    try:
+        panneau = await salon.fetch_message(int(mid))
+        await panneau.edit(
+            embed=embed_panel_vocal(info["type"], info.get("masque", False),
+                                    info.get("verrou", False),
+                                    emoji=emoji_type(gconf["types"].get(info["type"], {}))),
+            view=PanelVocalView(info.get("masque", False), info.get("verrou", False),
+                                features=panel_features(gconf)))
+    except discord.HTTPException:
+        logging.warning("Panneau introuvable ou non modifiable pour %s", salon.id)
+
+
+async def actualiser_panneaux_serveur(guild, gconf):
+    for cid, info in list(gconf["temp_channels"].items()):
+        salon = guild.get_channel(int(cid))
+        if isinstance(salon, discord.VoiceChannel) and info.get("panel_message_id"):
+            await actualiser_panneau_vocal(salon, info, gconf)
 
 
 async def nettoyer_orphelin(salon: discord.VoiceChannel, gconf: dict, nom_type: str):
@@ -698,10 +952,13 @@ async def _creer_vocal_temporaire_verrouille(interaction: discord.Interaction, m
         pass
 
     try:
-        await nouveau_salon.send(
+        panneau = await nouveau_salon.send(
             embed=embed_panel_vocal(nom_type, masque_initial, False, emoji=emoji_type(type_info)),
-            view=PanelVocalView(masque=masque_initial, verrou=False),
+            view=PanelVocalView(masque=masque_initial, verrou=False,
+                                features=panel_features(gconf)),
         )
+        gconf["temp_channels"][str(nouveau_salon.id)]["panel_message_id"] = panneau.id
+        sauvegarder_configuration()
     except discord.HTTPException:
         pass
 
@@ -728,6 +985,9 @@ async def transfert_proprietaire(salon: discord.VoiceChannel, info: dict, nouvea
     overwrites[nouveau] = owner_overwrite
     await salon.edit(overwrites=overwrites, reason="Beflow : changement de propriétaire")
     info["owner_id"] = nouveau.id
+    # Le nouveau propriétaire n'est plus un simple invité : le transfert crée
+    # maintenant ses permissions de propriétaire, qui seront retirées au départ.
+    guest_access(info).pop(str(nouveau.id), None)
     sauvegarder_configuration()
     try:
         await salon.send(f"👑 {nouveau.display_name} est maintenant propriétaire de ce vocal.",
@@ -882,6 +1142,11 @@ def embed_config(gconf: dict) -> discord.Embed:
     embed.add_field(name=f"Hubs ({len(gconf['hubs'])})", value=hubs_txt[:1024], inline=False)
     embed.add_field(name=f"Catégories restreintes ({len(gconf.get('categories', {}))})", value=categories_txt[:1024], inline=False)
     embed.add_field(name="Mots interdits", value=banwords_txt[:1024], inline=False)
+    etats = panel_features(gconf)
+    embed.add_field(
+        name="Boutons supplémentaires du panneau",
+        value="\n".join(f"{'✅' if actif else '❌'} **{PANEL_FEATURES[cle]}**"
+                         for cle, actif in etats.items()), inline=False)
     embed.set_footer(text="Panneau valable 5 minutes • Visible uniquement par toi")
     return embed
 
@@ -1653,6 +1918,53 @@ class BanwordsModal(discord.ui.Modal, title="Mots interdits (renommage)"):
         await retour_config(interaction, self.guild_id, self.auteur_id)
 
 
+# ── Fonctionnalités du panneau par serveur (V2.1) ────────────
+def embed_fonctions_vocal(gconf: dict) -> discord.Embed:
+    etats = panel_features(gconf)
+    embed = discord.Embed(
+        title="🎛️ Fonctions du panneau vocal",
+        description="Active ou désactive les nouveaux boutons pour ce serveur uniquement.\n"
+                    "Les modifications sont immédiatement appliquées aux actions, "
+                    "même si un ancien panneau n'a pas encore été actualisé.",
+        color=0xFFD700)
+    for cle, titre in PANEL_FEATURES.items():
+        embed.add_field(name=titre, value="✅ Activé" if etats[cle] else "❌ Désactivé", inline=False)
+    return embed
+
+
+class VueFonctionsVocal(VueBase):
+    def __init__(self, guild_id: int, auteur_id: int):
+        super().__init__(guild_id, auteur_id)
+        self._reconstruire()
+
+    def _reconstruire(self):
+        self.clear_items()
+        etats = panel_features(config_serveur(self.guild_id))
+        for index, (cle, titre) in enumerate(PANEL_FEATURES.items()):
+            bouton = discord.ui.Button(
+                label=f"{titre[:35]} : {'Oui' if etats[cle] else 'Non'}",
+                style=discord.ButtonStyle.success if etats[cle] else discord.ButtonStyle.secondary,
+                row=index // 2)
+            async def clic(interaction: discord.Interaction, cle=cle):
+                gconf = config_serveur(self.guild_id)
+                toggle_feature(gconf, cle)
+                sauvegarder_configuration()
+                self._reconstruire()
+                await interaction.response.edit_message(embed=embed_fonctions_vocal(gconf), view=self)
+                self.message = interaction.message
+                # Rafraîchissement des panneaux existants sans ralentir le menu.
+                asyncio.create_task(actualiser_panneaux_serveur(interaction.guild, gconf))
+            bouton.callback = clic
+            self.add_item(bouton)
+        retour = discord.ui.Button(label="Retour à la configuration", emoji="⬅️",
+                                   style=discord.ButtonStyle.primary, row=2)
+        retour.callback = self.retour
+        self.add_item(retour)
+
+    async def retour(self, interaction: discord.Interaction):
+        await retour_config(interaction, self.guild_id, self.auteur_id)
+
+
 # ── Panneau principal ────────────────────────────────────────
 class VueConfig(VueBase):
     def __init__(self, guild_id: int, auteur_id: int):
@@ -1753,6 +2065,12 @@ class VueConfig(VueBase):
         gconf = config_serveur(self.guild_id)
         await interaction.response.send_modal(BanwordsModal(self.guild_id, self.auteur_id, gconf))
 
+    @discord.ui.button(label="Fonctions du panneau", style=discord.ButtonStyle.primary, emoji="🎛️", row=2)
+    async def bouton_fonctions_vocal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gconf = config_serveur(self.guild_id)
+        vue = VueFonctionsVocal(self.guild_id, self.auteur_id)
+        await maj_panneau(interaction, embed_fonctions_vocal(gconf), vue)
+
     @discord.ui.button(label="Actualiser", style=discord.ButtonStyle.secondary, emoji="🔄", row=3)
     async def bouton_actualiser(self, interaction: discord.Interaction, button: discord.ui.Button):
         gconf = config_serveur(self.guild_id)
@@ -1809,7 +2127,7 @@ CMDS = {
             "créer/modifier/supprimer un type (nom, limite, emoji, format de nom, options), "
             "créer/supprimer un hub, configurer un hub (types disponibles + catégorie cible), "
             "gérer une catégorie Discord (renommage, accès par rôle) et gérer la liste des mots "
-            "interdits.\n\n"
+            "interdits, et activer/désactiver les quatre nouveaux boutons du panneau vocal.\n\n"
             "**Permission requise :** Gérer les salons"
         ),
     },
@@ -1884,8 +2202,14 @@ CMDS = {
             "renommage est refusé s'il contient un mot interdit.\n"
             "**🙈 Masquer / 👁️ Afficher** — cache le vocal pour tout le monde sauf toi.\n"
             "**🔒 Verrouiller / 🔓 Déverrouiller** — empêche quiconque de te rejoindre (sans "
-            "déconnecter les membres déjà présents).\n\n"
-            "Ces boutons sont utilisables uniquement par le créateur du vocal. Si le créateur "
+            "déconnecter les membres déjà présents).\n"
+            "**✅ Autoriser** — donne ou retire l'accès à un membre dans un vocal privé/verrouillé, "
+            "sans contourner les restrictions de catégorie.\n"
+            "**🚪 Expulser** — déconnecte un membre présent ; il peut revenir si le vocal est ouvert.\n"
+            "**👑 Transférer** — donne volontairement la propriété à un membre présent.\n"
+            "**ℹ️ Informations** — affiche l'état du vocal et ses invités.\n\n"
+            "Ces quatre nouvelles fonctions peuvent être désactivées par serveur dans `/vocal config`. "
+            "Les boutons de gestion sont utilisables uniquement par le propriétaire présent dans son vocal. Si celui-ci "
             "quitte le vocal alors qu'il reste du monde, la propriété est transférée "
             "automatiquement au premier membre présent."
         ),
@@ -1906,13 +2230,14 @@ def embed_apercu() -> discord.Embed:
             "🔊 Créer / modifier un type — nom, emoji, limite, options\n"
             "🔀 Configurer un hub — types disponibles et catégorie cible\n"
             "📁 Gérer une catégorie — renommage et accès par rôle\n"
-            "🚫 Mots interdits — bloquer certains mots au renommage"
+            "🚫 Mots interdits — bloquer certains mots au renommage\n"
+            "🎛️ Fonctions du panneau — activer les nouveaux boutons"
         ),
         inline=False,
     )
     embed.add_field(
         name="👤 Membres",
-        value="🎛️ Un panneau de boutons (renommer / limite / masquer / verrouiller) apparaît directement dans chaque vocal créé.",
+        value="🎛️ Huit boutons : Renommer, Limite, Masquer, Verrouiller, Autoriser, Expulser, Transférer et Informations.",
         inline=False,
     )
     embed.set_footer(text="Vocaux temporaires • Menu valable 3 minutes")
