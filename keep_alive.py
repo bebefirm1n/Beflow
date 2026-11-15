@@ -6,7 +6,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Le bot est en ligne sale PD de merde !"
+    return "Peppa pig ! groin"
 
 def run():
     # Render impose sa propre variable PORT
