@@ -1,2 +1,9 @@
 .env
-*.env
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+vocaux_config.json
+vocaux_config.json.backup-*
+__pycache__/
+*.pyc
